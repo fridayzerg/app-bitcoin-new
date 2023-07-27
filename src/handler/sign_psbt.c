@@ -54,6 +54,21 @@
 
 #include "../swap/swap_globals.h"
 
+#include "cx_rng.h"
+#include "cx_ecfp.h"
+#include "cx_eddsa.h"
+#include "cx_hash.h"
+#include "cx_utils.h"
+#include "cx_ram.h"
+// #include "ox_ec.h"
+
+cx_err_t cx_ecschnorr_sign_no_throw_cus(const cx_ecfp_private_key_t *pv_key,
+                           uint32_t                     mode,
+                           cx_md_t                      hashID,
+                           const uint8_t *              msg,
+                           size_t                       msg_len,
+                           uint8_t *                    sig,
+                           size_t *                     sig_len);
 // common info that applies to either the current input or the current output
 typedef struct {
     merkleized_map_commitment_t map;
@@ -1964,6 +1979,15 @@ sign_sighash_schnorr_and_yield(dispatcher_context_t *dc,
             error = true;
         }
     } while (false);
+    PRINTF("get result %d : ", sig_len);
+    for (int i = 0; i< sig_len;i++){
+        PRINTF("%02x", sig[i]);
+    }
+    PRINTF(" hash: ");
+    for(int i = 0;i < 32;i++){
+        PRINTF("%02x", sighash[i]);
+    }
+    PRINTF("\n");
 
     explicit_bzero(&private_key, sizeof(private_key));
 
@@ -1995,7 +2019,7 @@ sign_sighash_schnorr_and_yield(dispatcher_context_t *dc,
                          sig,
                          sig_len))
         return false;
-
+    PRINTF("cx_ecschnorr_sign_no_throw_cus end true %d \n", sig_len);
     return true;
 }
 
@@ -2509,4 +2533,369 @@ void handler_sign_psbt(dispatcher_context_t *dc, uint8_t protocol_version) {
     }
 
     SEND_SW(dc, SW_OK);
+}
+
+
+#define CX_CHECK_PRINTF(call)	do {              \
+    error = call;                                 \
+    if (error) {                                  \
+      PRINTF("throw error %u, line: %d \n", error, __LINE__);  \
+      goto end;                                   \
+    }                                             \
+  } while (0)
+
+
+/* BIP0340 tags for computing the tagged hashes */
+const uint8_t BIP0340_challenge[] = {'B', 'I', 'P', '0', '3', '4', '0', '/', 'c', 'h', 'a', 'l', 'l', 'e', 'n', 'g', 'e'};
+const uint8_t BIP0340_aux[]       = {'B', 'I', 'P', '0', '3', '4', '0', '/', 'a', 'u', 'x'};
+const uint8_t BIP0340_nonce[]     = {'B', 'I', 'P', '0', '3', '4', '0', '/', 'n', 'o', 'n', 'c', 'e'};
+
+cx_err_t cx_ecschnorr_sign_no_throw_cus(const cx_ecfp_private_key_t *pv_key,
+                           uint32_t                     mode,
+                           cx_md_t                      hashID,
+                           const uint8_t *              msg,
+                           size_t                       msg_len,
+                           uint8_t *                    sig,
+                           size_t *                     sig_len) {
+#define CX_MAX_TRIES 100
+#define H G_cx.sha256
+
+  size_t                        size;
+  cx_ecpoint_t                  Q;
+  cx_bn_t                       bn_k, bn_d, bn_r, bn_s, bn_n;
+  uint8_t                       R[33];
+  uint8_t                       S[32];
+  uint8_t                       P[32];
+  int                           odd;
+  uint8_t                       tries;
+  cx_err_t                      error;
+  int                           diff;
+
+  CX_CHECK_PRINTF(cx_ecdomain_parameters_length(pv_key->curve, &size));
+
+  // Only secp256k1 is allowed when using CX_ECSCHNORR_BIP0340
+  if (((mode & CX_MASK_EC) == CX_ECSCHNORR_BIP0340) && (pv_key->curve != CX_CURVE_SECP256K1)) {
+    return CX_EC_INVALID_CURVE;
+  }
+
+  // WARN: only accept weierstrass 256 bits curve for now
+  if (hashID != CX_SHA256 || size != 32 ||
+      !CX_CURVE_RANGE(pv_key->curve, WEIERSTRASS) ||
+      pv_key->d_len != size) {
+    return CX_INVALID_PARAMETER;
+  }
+
+  // Schnorr BIP0340 signature is not DER encoded and is 64-byte long.
+  if (((mode & CX_MASK_EC) != CX_ECSCHNORR_BIP0340) && (*sig_len < (6 + 2 * (size + 1)))) {
+    return CX_INVALID_PARAMETER;
+  }
+
+  CX_CHECK_PRINTF(cx_bn_lock(size, 0));
+  CX_CHECK_PRINTF(cx_bn_alloc(&bn_n, size));
+  CX_CHECK_PRINTF(cx_ecdomain_parameter_bn(pv_key->curve, CX_CURVE_PARAM_Order, bn_n));
+  CX_CHECK_PRINTF(cx_bn_alloc(&bn_k, size));
+  CX_CHECK_PRINTF(cx_bn_alloc(&bn_d, size));
+  CX_CHECK_PRINTF(cx_bn_alloc(&bn_r, size));
+  CX_CHECK_PRINTF(cx_bn_alloc(&bn_s, size));
+  CX_CHECK_PRINTF(cx_ecpoint_alloc(&Q, pv_key->curve));
+
+  if ((mode & CX_MASK_EC) == CX_ECSCHNORR_BIP0340) {
+    // Q = [d].G
+    CX_CHECK_PRINTF(cx_ecdomain_generator_bn(pv_key->curve, &Q));
+    CX_CHECK_PRINTF(cx_ecpoint_rnd_fixed_scalarmul(&Q, pv_key->d, size));
+    // If Qy is even use d otherwise use n-d
+    CX_CHECK_PRINTF(cx_bn_init(bn_d, pv_key->d, size));
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, NULL, 0, P, size));
+    odd = P[size - 1] & 1;
+    if (odd) {
+      CX_CHECK_PRINTF(cx_bn_sub(bn_d, bn_n, bn_d));
+    }
+    // tag_hash = SHA256("BIP0340/aux")
+    // SHA256(tag_hash || tag_hash || aux_rnd)
+    cx_sha256_init_no_throw(&H);
+    cx_hash_no_throw((cx_hash_t *)&H, CX_LAST, BIP0340_aux, sizeof(BIP0340_aux), R, size);
+    cx_sha256_init_no_throw(&H);
+    cx_hash_no_throw((cx_hash_t *)&H, 0, R, size, NULL, 0);
+    cx_hash_no_throw((cx_hash_t *)&H, 0, R, size, NULL, 0);
+    cx_hash_no_throw((cx_hash_t *)&H, CX_LAST | CX_NO_REINIT, sig, size, R, size);
+    // t = d ^ SHA256(tag_hash || tag_hash || aux_rnd)
+    CX_CHECK_PRINTF(cx_bn_init(bn_k, R, size));
+    CX_CHECK_PRINTF(cx_bn_xor(bn_r, bn_d, bn_k));
+    CX_CHECK_PRINTF(cx_bn_export(bn_r, sig, size));
+    // tag_hash = SHA256("BIP0340/nonce")
+    // SHA256(tag_hash || tag_hash || t || Qx || msg)
+    cx_sha256_init_no_throw(&H);
+    cx_hash_no_throw((cx_hash_t *)&H, CX_LAST, BIP0340_nonce, sizeof(BIP0340_nonce), R, size);
+    cx_sha256_init_no_throw(&H);
+    cx_hash_no_throw((cx_hash_t *)&H, 0, R, size, NULL, 0);
+    cx_hash_no_throw((cx_hash_t *)&H, 0, R, size, NULL, 0);
+    cx_hash_no_throw((cx_hash_t *)&H, 0, sig, size, NULL, 0);
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, P, size, NULL, 0));
+    cx_hash_no_throw((cx_hash_t *)&H, 0, P, size, NULL, 0);
+    cx_hash_no_throw((cx_hash_t *)&H, CX_LAST | CX_NO_REINIT, msg, size, sig, size);
+  }
+
+  // generate random
+  tries = 0;
+ RETRY:
+  if (tries == CX_MAX_TRIES) {
+    goto end;
+  }
+
+  switch (mode & CX_MASK_RND) {
+  case CX_RND_PROVIDED:
+    if (tries) {
+      goto end;
+    }
+    CX_CHECK_PRINTF(cx_bn_init(bn_r, sig, size));
+    CX_CHECK_PRINTF(cx_bn_reduce(bn_k, bn_r, bn_n));
+    break;
+
+  case CX_RND_TRNG:
+    CX_CHECK_PRINTF(cx_bn_rng(bn_k, bn_n));
+    break;
+
+  default:
+    error = CX_INVALID_PARAMETER;
+    goto end;
+  }
+  if ((mode & CX_MASK_EC) == CX_ECSCHNORR_BIP0340) {
+    CX_CHECK_PRINTF(cx_bn_cmp_u32(bn_k, 0, &diff));
+    if (diff == 0) {
+      error = CX_INVALID_PARAMETER;
+      goto end;
+    }
+  }
+  CX_CHECK_PRINTF(cx_bn_export(bn_k, sig, size));
+
+  // sign
+  tries++;
+ RETRY2:
+  CX_CHECK_PRINTF(cx_ecdomain_generator_bn(pv_key->curve, &Q));
+  CX_CHECK_PRINTF(cx_ecpoint_rnd_fixed_scalarmul(&Q, sig, size));
+
+  switch (mode & CX_MASK_EC) {
+  case CX_ECSCHNORR_ISO14888_XY:
+  case CX_ECSCHNORR_ISO14888_X:
+    // 1. Generate a random k from [1, ..., order-1]
+    // 2. Q = G*k
+    // 3. r = H(Q.x||Q.y||M)
+    // 4. s = (k+r*pv_key.d)%n
+    cx_sha256_init_no_throw(&H);
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, sig, size, NULL, 0));
+    cx_hash_no_throw((cx_hash_t *)&H, 0, sig, size, NULL, 0);
+    if ((mode & CX_MASK_EC) == CX_ECSCHNORR_ISO14888_XY) {
+      CX_CHECK_PRINTF(cx_ecpoint_export(&Q, NULL, 0, sig, size));
+      cx_hash_no_throw((cx_hash_t *)&H, 0, sig, size, NULL, 0);
+    }
+    cx_hash_no_throw((cx_hash_t *)&H, CX_LAST | CX_NO_REINIT, msg, msg_len, R, sizeof(R));
+
+    CX_CHECK_PRINTF(cx_bn_init(bn_d, R, 32));
+    CX_CHECK_PRINTF(cx_bn_reduce(bn_r, bn_d, bn_n));
+    CX_CHECK_PRINTF(cx_bn_cmp_u32(bn_r, 0, &diff));
+    if (diff == 0) {
+      cx_bn_unlock();
+      goto RETRY;
+    }
+
+    CX_CHECK_PRINTF(cx_bn_init(bn_d, pv_key->d, pv_key->d_len));
+    CX_CHECK_PRINTF(cx_bn_mod_mul(bn_s, bn_d, bn_r, bn_n));
+    CX_CHECK_PRINTF(cx_bn_mod_add(bn_s, bn_k, bn_s, bn_n));
+    CX_CHECK_PRINTF(cx_bn_set_u32(bn_k, 0));
+    CX_CHECK_PRINTF(cx_bn_mod_sub(bn_s, bn_s, bn_k, bn_n));
+
+    CX_CHECK_PRINTF(cx_bn_cmp_u32(bn_s, 0, &diff));
+    if (diff == 0) {
+      goto RETRY;
+    }
+    CX_CHECK_PRINTF(cx_bn_export(bn_s, S, 32));
+    break;
+
+  case CX_ECSCHNORR_BSI03111:
+    // 1. Q = G*k
+    // 2. r = H((msg+xQ), and r%n != 0
+    // 3. s = (k-r*pv_key.d)%n
+    // r = H((msg+xQ), and r%n != 0
+    cx_sha256_init_no_throw(&H);
+    cx_hash_no_throw((cx_hash_t *)&H, 0, msg, msg_len, NULL, 0);
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, sig, size, NULL, 0));
+    cx_hash_no_throw((cx_hash_t *)&H, CX_LAST | CX_NO_REINIT, sig, size, R, sizeof(R));
+
+    CX_CHECK_PRINTF(cx_bn_init(bn_d, R, CX_SHA256_SIZE));
+    CX_CHECK_PRINTF(cx_bn_reduce(bn_r, bn_d, bn_n));
+    CX_CHECK_PRINTF(cx_bn_cmp_u32(bn_r, 0, &diff));
+    if (diff == 0) {
+      goto RETRY;
+    }
+
+    // s = (k-r*pv_key.d)%n
+    CX_CHECK_PRINTF(cx_bn_init(bn_d, pv_key->d, pv_key->d_len));
+    CX_CHECK_PRINTF(cx_bn_mod_mul(bn_s, bn_d, bn_r, bn_n));
+    CX_CHECK_PRINTF(cx_bn_mod_sub(bn_s, bn_k, bn_s, bn_n));
+
+    CX_CHECK_PRINTF(cx_bn_cmp_u32(bn_s, 0, &diff));
+    if (diff == 0) {
+      goto RETRY;
+    }
+    CX_CHECK_PRINTF(cx_bn_export(bn_s, S, 32));
+    break;
+
+  case CX_ECSCHNORR_Z:
+    // https://github.com/Zilliqa/Zilliqa/blob/master/src/libCrypto/Schnorr.cpp#L580
+    // https://docs.zilliqa.com/whitepaper.pdf
+    // 1. Generate a random k from [1, ..., order-1]
+    // 2. Compute the commitment Q = kG, where  G is the base point
+    // 3. Compute the challenge r = H(Q, kpub, m) [CME: mod n according to pdf/code, Q and kpub compressed "02|03 x"
+    // according to code)
+    // 4. If r = 0 mod(order), goto 1
+    // 4. Compute s = k - r*kpriv mod(order)
+    // 5. If s = 0 goto 1.
+    // 5  Signature on m is (r, s)
+
+    // Q
+    cx_sha256_init_no_throw(&H);
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, NULL, 0, sig, size));
+    odd = sig[size - 1] & 1;
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, sig + 1, size, NULL, 0));
+    sig[0] = odd ? 0x03 : 0x02;
+    cx_hash_no_throw((cx_hash_t *)&H, 0, sig, 1 + size, NULL, 0); // Q
+    // kpub
+    CX_CHECK_PRINTF(cx_ecdomain_generator_bn(pv_key->curve, &Q));
+    CX_CHECK_PRINTF(cx_ecpoint_rnd_fixed_scalarmul(&Q, pv_key->d, pv_key->d_len));
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, NULL, 0, sig, size));
+    odd = sig[size - 1] & 1;
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, sig + 1, size, NULL, 0));
+    sig[0] = odd ? 0x03 : 0x02;
+    cx_hash_no_throw((cx_hash_t *)&H, 0, sig, 1 + size, NULL, 0); // Q
+    // m
+    cx_hash_no_throw((cx_hash_t *)&H, CX_LAST | CX_NO_REINIT, msg, msg_len, R, sizeof(R));
+
+    // Compute the challenge r = H(Q, kpub, m)
+    //[CME: mod n according to pdf/code, Q and kpub compressed "02|03 x" according to code)
+    CX_CHECK_PRINTF(cx_bn_init(bn_d, R, CX_SHA256_SIZE));
+    CX_CHECK_PRINTF(cx_bn_reduce(bn_r, bn_d, bn_n));
+    CX_CHECK_PRINTF(cx_bn_cmp_u32(bn_r, 0, &diff));
+    if (diff == 0) {
+      goto RETRY;
+    }
+    CX_CHECK_PRINTF(cx_bn_export(bn_r, R, 32));
+
+    CX_CHECK_PRINTF(cx_bn_init(bn_d, pv_key->d, pv_key->d_len));
+    CX_CHECK_PRINTF(cx_bn_mod_mul(bn_s, bn_d, bn_r, bn_n));
+    CX_CHECK_PRINTF(cx_bn_mod_sub(bn_s, bn_k, bn_s, bn_n));
+    CX_CHECK_PRINTF(cx_bn_cmp_u32(bn_s, 0, &diff));
+    if (diff == 0) {
+      goto RETRY;
+    }
+    CX_CHECK_PRINTF(cx_bn_export(bn_s, S, 32));
+    break;
+
+  case CX_ECSCHNORR_LIBSECP:
+    // Inputs: 32-byte message m, 32-byte scalar key x (!=0), 32-byte scalar nonce k (!=0)
+    // 1. Compute point R = k * G. Reject nonce if R's y coordinate is odd (or negate nonce).
+    // 2. Compute 32-byte r, the serialization of R's x coordinate.
+    // 3. Compute scalar h = Hash(r || m). Reject nonce if h == 0 or h >= order.
+    // 4. Compute scalar s = k - h * x.
+    // 5. The signature is (r, s).
+    // Q = G*k
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, NULL, 0, sig, size));
+    odd = sig[size - 1] & 1;
+    if (odd) {
+      // if y is odd, k <- -k mod n = n-k,  and retry
+      CX_CHECK_PRINTF(cx_bn_mod_sub(bn_k, bn_n, bn_k, bn_n));
+      CX_CHECK_PRINTF(cx_bn_export(bn_k, sig, size));
+      goto RETRY2;
+    }
+    // r = xQ
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, R, size, NULL, 0));
+    CX_CHECK_PRINTF(cx_bn_init(bn_d, R, size));
+    CX_CHECK_PRINTF(cx_bn_reduce(bn_r, bn_d, bn_n));
+    CX_CHECK_PRINTF(cx_bn_cmp_u32(bn_r, 0, &diff));
+    if (diff == 0) {
+      goto RETRY;
+    }
+    // h = Hash(r || m).
+    cx_sha256_init_no_throw(&H);
+    cx_hash_no_throw((cx_hash_t *)&H, 0, R, size, NULL, 0);
+    cx_hash_no_throw((cx_hash_t *)&H, CX_LAST | CX_NO_REINIT, msg, msg_len, sig, sizeof(S));
+    // Reject nonce if h == 0 or h >= order.
+    CX_CHECK_PRINTF(cx_bn_init(bn_r, sig, 32));
+    CX_CHECK_PRINTF(cx_bn_cmp_u32(bn_r, 0, &diff));
+    if (diff == 0) {
+      goto RETRY;
+    }
+    CX_CHECK_PRINTF(cx_bn_cmp(bn_r, bn_n, &diff));
+    if (diff >= 0) {
+      goto RETRY;
+    }
+    // s = k - h * x.
+    CX_CHECK_PRINTF(cx_bn_init(bn_d, pv_key->d, pv_key->d_len));
+    CX_CHECK_PRINTF(cx_bn_mod_mul(bn_s, bn_d, bn_r, bn_n));
+    CX_CHECK_PRINTF(cx_bn_mod_sub(bn_s, bn_k, bn_s, bn_n));
+    CX_CHECK_PRINTF(cx_bn_cmp_u32(bn_s, 0, &diff));
+    if (diff == 0) {
+      goto RETRY;
+    }
+    CX_CHECK_PRINTF(cx_bn_export(bn_s, S, 32));
+    break;
+
+  /* Schnorr signature with secp256k1 according to BIP0340
+  ** https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki */
+
+  case CX_ECSCHNORR_BIP0340:
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, NULL, 0, sig, size));
+    odd = sig[size - 1] & 1;
+    if (odd) {
+      CX_CHECK_PRINTF(cx_bn_sub(bn_k, bn_n, bn_k));
+      CX_CHECK_PRINTF(cx_bn_export(bn_k, sig, size));
+    }
+    // Only take the x-coordinate
+    CX_CHECK_PRINTF(cx_ecpoint_export(&Q, R, size, NULL, 0));
+
+    // tag_hash = SHA256("BIP0340_challenge")
+    // e = SHA256(tag_hash || tag_hash || Rx || Px || msg)
+    cx_sha256_init_no_throw(&H);
+    cx_hash_no_throw((cx_hash_t *)&H, CX_LAST, BIP0340_challenge, sizeof(BIP0340_challenge), sig, size);
+    cx_sha256_init_no_throw(&H);
+    cx_hash_no_throw((cx_hash_t *)&H, 0, sig, size, NULL, 0);
+    cx_hash_no_throw((cx_hash_t *)&H, 0, sig, size, NULL, 0);
+    cx_hash_no_throw((cx_hash_t *)&H, 0, R, size, NULL, 0);
+    cx_hash_no_throw((cx_hash_t *)&H, 0, P, size, NULL, 0);
+    cx_hash_no_throw((cx_hash_t *)&H, CX_LAST | CX_NO_REINIT, msg, msg_len, sig, size);
+
+    // e = e % n
+    CX_CHECK_PRINTF(cx_bn_init(bn_s, sig, size));
+    CX_CHECK_PRINTF(cx_bn_reduce(bn_r, bn_s, bn_n));
+
+    // s = (k + e *d) % n
+    CX_CHECK_PRINTF(cx_bn_mod_mul(bn_s, bn_d, bn_r, bn_n));
+    CX_CHECK_PRINTF(cx_bn_mod_add(bn_s, bn_k, bn_s, bn_n));
+    CX_CHECK_PRINTF(cx_bn_set_u32(bn_k, 0));
+    CX_CHECK_PRINTF(cx_bn_mod_sub(bn_s, bn_s, bn_k, bn_n));
+
+    CX_CHECK_PRINTF(cx_bn_export(bn_s, S, size));
+    break;
+
+  default:
+    error = CX_INVALID_PARAMETER;
+    goto end;
+  }
+
+ end:
+//   cx_hash_destroy((cx_hash_t*)&H);
+    // explicit_bzero((cx_hash_t*)&H, ((cx_hash_t*)&H).info->ctx_size);
+  
+  cx_bn_unlock();
+  if (error == CX_OK) {
+    if ((mode & CX_MASK_EC) == CX_ECSCHNORR_BIP0340) {
+      *sig_len = 64;
+      memcpy(sig, R, 32);
+      memcpy(sig + 32, S, 32);
+    } else {
+      // encoding
+      *sig_len = cx_ecfp_encode_sig_der(sig, *sig_len, R, size, S, size);
+    }
+
+  }
+  return error;
 }

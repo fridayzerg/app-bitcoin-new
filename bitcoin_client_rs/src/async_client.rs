@@ -338,7 +338,7 @@ impl<T: Transport> BitcoinClient<T> {
                     command: cmd.ins,
                     data: result.clone(),
                 })?;
-
+            println!("result {}", hex::encode(&result));
             signatures.push((
                 input_index.0 as usize,
                 PartialSignature::from_slice(&result[i..]).map_err(|_| {

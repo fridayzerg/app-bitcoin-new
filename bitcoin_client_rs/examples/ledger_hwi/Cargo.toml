@@ -8,7 +8,7 @@ edition = "2018"
 clap = { version = "4.0.18", features = ["derive"] }
 ledger_bitcoin_client = { path = "../.." }
 async-trait = { version = "0.1"}
-bitcoin = { version = "0.30", default-features = false, features = ["no-std"] }
+bitcoin = { version = "0.30", default-features = false, features = ["no-std", "serde"] }
 hex = "0.4"
 base64 = "0.13.0"
 ledger-apdu = "0.10"
@@ -17,3 +17,5 @@ hidapi = { version = "1.4.1", features = ["linux-static-hidraw"], default-featur
 tokio = { version = "1.21", features = ["macros", "net", "rt", "rt-multi-thread", "io-util", "sync"] }
 regex = "1.6.0"
 anyhow = "1.0.0"
+serde_json = "1.0"
+bitcoincore-rpc = "0.17.0"
